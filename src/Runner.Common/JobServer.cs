@@ -2,16 +2,19 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Net.Http;
 using System.Threading;
 using System.Threading.Tasks;
+using GitHub.Runner.Sdk;
 using GitHub.Services.WebApi;
+using GitHub.Services.Common;
 
 namespace GitHub.Runner.Common
 {
     [ServiceLocator(Default = typeof(JobServer))]
     public interface IJobServer : IRunnerService
     {
-        Task ConnectAsync(VssConnection jobConnection);
+        Task ConnectAsync(Uri jobServerUrl, VssCredentials jobServerCredential, IThrottlingReporter jobServerQueue = null);
 
         // logging and console
         Task<TaskLog> AppendLogContentAsync(Guid scopeIdentifier, string hubName, Guid planId, int logId, Stream uploadStream, CancellationToken cancellationToken);
@@ -32,20 +35,21 @@ namespace GitHub.Runner.Common
         private VssConnection _connection;
         private TaskHttpClient _taskClient;
 
-        public async Task ConnectAsync(VssConnection jobConnection)
+        public async Task ConnectAsync(Uri jobServerUrl, VssCredentials jobServerCredential, IThrottlingReporter jobServerQueue = null)
         {
-            _connection = jobConnection;
+            Trace.Info($"Establishing connection for JobServer");
             int attemptCount = 5;
-            while (!_connection.HasAuthenticated && attemptCount-- > 0)
+
+            while (attemptCount-- > 0)
             {
                 try
                 {
-                    await _connection.ConnectAsync();
+                    RefreshConnection(jobServerUrl, jobServerCredential, jobServerQueue);
                     break;
                 }
                 catch (Exception ex) when (attemptCount > 0)
                 {
-                    Trace.Info($"Catch exception during connect. {attemptCount} attemp left.");
+                    Trace.Info($"Catch exception during connect. {attemptCount} attempts left.");
                     Trace.Error(ex);
                 }
 
@@ -54,6 +58,37 @@ namespace GitHub.Runner.Common
 
             _taskClient = _connection.GetClient<TaskHttpClient>();
             _hasConnection = true;
+        }
+
+        // Refresh connection is best effort. it should never throw exception
+        private void RefreshConnection(Uri jobServerUrl, VssCredentials jobServerCredential, IThrottlingReporter jobServerQueue = null)
+        {
+            Trace.Info($"Refresh JobServer VssConnection to get on a different AFD node.");
+
+            VssConnection newConnection = null;
+
+            try
+            {
+                _hasConnection = false;
+
+                newConnection = VssUtil.CreateConnection(
+                    jobServerUrl, 
+                    jobServerCredential,
+                    new DelegatingHandler[] { new ThrottlingReportHandler(jobServerQueue) }
+                    );
+
+                _connection = newConnection;
+            }
+            catch (Exception ex)
+            {
+                Trace.Error($"Catch exception during resetting JobServer connection.");
+                Trace.Error(ex);
+                newConnection?.Dispose();
+            }
+            finally
+            {
+                _hasConnection = true;
+            }
         }
 
         private void CheckConnection()
